@@ -4,15 +4,20 @@
 
 # RustChain
 
+<img src="docs/rustchain_hero_terminal.png" alt="RustChain — Make Mining Meaningful Again" width="420">
+
 ### DePIN for Vintage Hardware — AI-Augmented Proof of Real Machines
 
 **The blockchain where old hardware outearns new hardware.**
 **And all hardware becomes old. It's just a matter of time.**
 
+*For AI teams: this is **Sybil-resistant agent authentication** — **hardware-attested agent identity** where a machine's compute provenance is verified by physics (oscillator drift, cache timing, thermal entropy), not by self-report. VM farms and bot swarms fingerprint as what they are.*
+
 [![CI](https://github.com/Scottcjn/Rustchain/actions/workflows/ci.yml/badge.svg)](https://github.com/Scottcjn/Rustchain/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/Scottcjn/Rustchain?style=flat&color=gold)](https://github.com/Scottcjn/Rustchain/stargazers)
-[![Nodes](https://img.shields.io/badge/Nodes-5%20Active-brightgreen)](https://rustchain.org/explorer/)
+[![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/XnRp7M5gBW)
+[![Nodes](https://img.shields.io/badge/Nodes-Live%20on%20explorer-brightgreen)](https://rustchain.org/explorer/)
 [![DePIN](https://img.shields.io/badge/DePIN-Vintage%20Hardware-8B4513)](https://rustchain.org)
 [![Proof of Antiquity](https://img.shields.io/badge/Consensus-Proof%20of%20Antiquity-DAA520)](docs/WHITEPAPER.md)
 [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19442753-blue)](https://doi.org/10.5281/zenodo.19442753)
@@ -20,9 +25,9 @@
 A PowerBook G4 from 2003 earns **2.5x** more than a modern Threadripper.
 A Power Mac G5 earns **2.0x**. A 486 with rusty serial ports earns the most respect of all.
 
-> ⭐ **Help us reach 512 stars** — the 2⁹ binary milestone (our supply is 2²³). If Proof-of-Antiquity is your kind of weird, [a star](https://github.com/Scottcjn/Rustchain/stargazers) helps more old machines get found. [Why 512?](https://github.com/Scottcjn/Rustchain/issues/7540)
+> ⭐ **Help us reach 512 stars** — the 2⁹ binary milestone (our supply is 2²³). If Proof-of-Antiquity is your kind of weird, [a star](https://github.com/Scottcjn/Rustchain) helps more old machines get found. [Why 512?](https://github.com/Scottcjn/Rustchain/issues/7540)
 
-[Explorer](https://rustchain.org/explorer/) · [Machines Preserved](https://rustchain.org/preserved.html) · [Install Miner](#quickstart) · [Beginner Guide](docs/QUICKSTART.md) · [Hardware Requirements](docs/HARDWARE_REQUIREMENTS.md) · [Manifesto](https://rustchain.org/manifesto.html) · [Whitepaper](docs/WHITEPAPER.md) · [Hire Us](CONSULTING.md)
+[Discord](https://discord.gg/XnRp7M5gBW) · [Explorer](https://rustchain.org/explorer/) · [Machines Preserved](https://rustchain.org/preserved.html) · [Install Miner](#quickstart) · [Beginner Guide](docs/QUICKSTART.md) · [FAQ](https://rustchain.org/faq) · [Hardware Requirements](docs/HARDWARE_REQUIREMENTS.md) · [Manifesto](MANIFESTO.md) · [Whitepaper](docs/WHITEPAPER.md) · [Hire Us](CONSULTING.md)
 
 Languages: [English](README.md) · [简体中文](docs/zh-CN/README.md) · [简体中文 (根目录)](README_ZH.md) · [繁體中文](README_ZH-TW.md) · [Español](README_ES.md) · [Deutsch](README_DE.md) · [日本語](README_JA.md) · [Русский](README_RU.md) · [Tiếng Việt](README.vi.md) · [Português (BR)](README.pt-BR.md) · [हिन्दी](README_HI.md) · [Italiano](docs/it-IT/README.md) · [한국어](docs/ko-KR/README.md) · [中文 API 快速参考](docs/zh-CN/API.md)
 
@@ -206,7 +211,7 @@ This isn't a roadmap. This is deployed and running:
 | **Execution** | [TrashClaw](https://github.com/Scottcjn/trashclaw) — zero-dep local LLM agent that runs on anything | Live |
 | **Social** | BoTTube — AI-native platform where agents create, trade, and engage | Live, 1,000+ videos |
 | **Bounties** | Agent-assisted contributions — AI helps humans earn RTC for real code | Live, 64,000+ RTC paid ([live](https://rustchain.org/payouts.json)) |
-| **Certification** | [BCOS](https://rustchain.org/bcos/) — blockchain-certified open source verification | Live, 44 certs issued |
+| **Certification** | [BCOS](BCOS.md) — blockchain-certified open source verification | Live, 44 certs issued |
 | **Provenance** | [Proof of Provenance (RIP-0310)](rips/docs/RIP-0310-proof-of-provenance.md) — binds agent identity + verified hardware to published content | Spec published ([DOI](https://doi.org/10.5281/zenodo.20502069)) |
 | **Frameworks** | Drop-in tools so any agent can query the network — [LangChain](https://github.com/Scottcjn/langchain-rustchain) (`pip install langchain-rustchain-tools`), plus CrewAI / AutoGen / Agno / smolagents in [`integrations/`](integrations/) | Live |
 
@@ -274,19 +279,25 @@ Payments run over the [Beacon](https://github.com/Scottcjn/beacon-skill) RustCha
 |------|----------|-------|
 | **Node 1** — 50.28.86.131 | Louisiana, US | Primary (LiquidWeb VPS) |
 | **Node 2** — 50.28.86.153 | Louisiana, US | Secondary + BoTTube (LiquidWeb VPS) |
-| **Node 3** — 76.8.228.245:8099 | US | First external node (Ryan's Proxmox) |
-| **Node 4** — 38.76.217.189:8099 | Hong Kong | First Asian node (CognetCloud) |
+| **Node 3** — 76.8.228.245:8099 | US | First external node (Ryan's Proxmox) — *volunteer node, offline since mid-2026* |
+| **Node 4** — 38.76.217.189:8099 | Hong Kong | First Asian node (CognetCloud) — *volunteer node, retired by operator* |
 | **Node 5** — POWER8 S824 | Local Lab | First non-x86 node (IBM ppc64le, 512GB RAM) |
 
 | Fact | Proof |
 |------|-------|
-| 5 nodes across 3 continents (NA ×3, Asia ×1, Local ×1) | [Live explorer](https://rustchain.org/explorer/) |
+| Attestation nodes: 2 always-on (Louisiana) + lab POWER8; 2 volunteer nodes have come and gone — that's what volunteer infra does | [Live explorer](https://rustchain.org/explorer/) |
 | 20+ miners attesting | `curl -fsS https://rustchain.org/api/miners` |
-| 44 BCOS certificates issued | [Certified repos](https://rustchain.org/bcos/) |
+| 44 BCOS certificates issued | [Certified repos](BCOS.md) |
 | 6 hardware fingerprint checks per machine | [Fingerprint docs](docs/attestation_fuzzing.md) |
 | 64,000+ RTC paid to 1,000+ recipients ([live counter](https://rustchain.org/payouts.json)) | [Public ledger](https://github.com/Scottcjn/rustchain-bounties/issues/104) |
 | Code merged upstream into OpenSSL (master + 5 release branches) | [#30437](https://github.com/openssl/openssl/pull/30437), [#30452](https://github.com/openssl/openssl/pull/30452) |
-| Open PRs on CPython, curl, wolfSSL, Ghidra | Listed in the upstream project PR trackers |
+| Code landed in curl (powerpc64 fast path, merged by hand per curl workflow) | [curl commit history](https://github.com/curl/curl/commits?author=Scottcjn) |
+| Integer-overflow finding fixed in wolfSSL (via their #9954) | [wolfSSL/wolfssl#9984](https://github.com/wolfSSL/wolfssl/pull/9984) |
+| Open PRs on Ghidra (e200 VLE PowerPC), wolfSSL (POWER8 AES), LLVM, PyTorch, vLLM | Listed in the upstream project PR trackers |
+
+### First Commercial Anchoring Engagement (July 2026)
+
+RustChain is the attestation chain for a live U.S. legal-corpus determinism engagement run by [Elyan Labs](https://elyanlabs.ai/verifiable-compute.html) for a research client: over one million units of federal and state law, roughly 1.3 billion tokens of LLM inference, processed under temperature-0, seed-pinned, sha-frozen conditions on a hardware-attested fleet. Every extracted span is substring-verified in code against its source text (measured false-content rate on the 21,221-unit reference run: zero), every hardware class is certified against golden outputs before it bills a dollar, and batch-level Merkle roots anchor to RustChain so a third party can verify existence and integrity without trusting anyone. Proof-of-Antiquity fingerprints on the worker fleet are part of the delivered provenance package.
 
 ---
 
@@ -375,11 +386,12 @@ Unlike Proof-of-Work where hash power = votes:
 ### Epoch Rewards
 
 ```
-Epoch: 10 minutes  |  Pool: 1.5 RTC/epoch  |  Split by antiquity weight
+Block: 10 min  |  Epoch: 144 blocks (~24h)  |  Pool: 1.5 RTC/epoch, split by antiquity weight
 
 G4 Mac (2.5x):     0.30 RTC  ████████████████████
 G5 Mac (2.0x):     0.24 RTC  ████████████████
 Modern PC (1.0x):  0.12 RTC  ████████
+       (example with 8 miners sharing the pool)
 ```
 
 ### Anti-VM Enforcement
@@ -468,11 +480,11 @@ Full tokenomics detail: [WHITEPAPER §6](docs/WHITEPAPER.md). Scenario analysis:
 | | Link |
 |--|------|
 | **Swap** | [Raydium DEX](https://raydium.io/swap/?inputMint=sol&outputMint=12TAdKXxcGf6oCv4rqDz2NkgxjyHq6HQKoxKZYGf5i4X) |
-| **Chart** | [DexScreener](https://dexscreener.com/solana/8CF2Q8nSCxRacDShbtF86XTSrYjueBMKmfdR3MLdnYzb) |
+| **Pool** | [Raydium CPMM pool `8CF2…nYzb`](https://raydium.io/liquidity-pools/?token=12TAdKXxcGf6oCv4rqDz2NkgxjyHq6HQKoxKZYGf5i4X) |
 | **Bridge** | [Bridge](https://bottube.ai/bridge/wrtc) |
 | **Guide** | [wRTC Quickstart](docs/wrtc.md) |
 
-> **Honest status:** wRTC is live and swappable on Solana, but the pool is **early-stage with very thin liquidity** — treat it as experimental, not a deep market. The `$0.15` figure for RTC is an **internal reference rate** for bounty accounting, not a market price or a promise of convertibility.
+> **Honest status:** wRTC is live and swappable on Solana, but the pool is **early-stage with very thin liquidity** (≈$1.5k TVL, near-zero volume as of 2026-08-28) — treat it as experimental, not a deep market. The `$0.15` figure for RTC is an **internal reference rate** for bounty accounting, not a market price or a promise of convertibility.
 
 ---
 
@@ -530,33 +542,21 @@ Named after a 486 laptop with oxidized serial ports that still boots to DOS and 
 
 ---
 
-<div align="center">
-
-**[Elyan Labs](https://elyanlabs.ai)** · Built with $0 VC and a room full of pawn shop hardware
-
-*"Mais, it still works, so why you gonna throw it away?"*
-
-[Boudreaux Principles](https://rustchain.org/principles.html) · [Green Tracker](https://rustchain.org/preserved.html) · [Bounties](https://github.com/Scottcjn/rustchain-bounties/issues)
-
-</div>
-
-
 ## Contributing
-Please read the [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and the [Bounty Board](https://github.com/Scottcjn/rustchain-bounties) for active tasks and rewards.
 
-
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and the [Bounty Board](https://github.com/Scottcjn/rustchain-bounties) for active tasks and rewards.
 
 ---
 
-### Troubleshooting
+## Troubleshooting
 
 <details>
 <summary><b>Miner not connecting to node</b></summary>
 
-Run the miner with --dry-run first to verify connectivity without submitting work:
+Preview what the installer would do without installing or mining:
 
 ```bash
-./clawrtc-miner --dry-run
+curl -sSL https://raw.githubusercontent.com/Scottcjn/Rustchain/main/install-miner.sh | bash -s -- --dry-run
 ```
 
 Check node health:
@@ -579,15 +579,17 @@ The miner name must exactly match the name used during first attestation.
 <details>
 <summary><b>Miner service won't start (systemd / launchd)</b></summary>
 
-Linux (systemd):
+The installer creates a **user-level** systemd service (no sudo needed):
+
 ```bash
-sudo systemctl status clawrtc-miner
-sudo journalctl -u clawrtc-miner --no-pager -n 50
+systemctl --user status rustchain-miner
+journalctl --user -u rustchain-miner --no-pager -n 50
 ```
 
 macOS (launchd):
 ```bash
-launchctl list | grep clawrtc
+launchctl list | grep rustchain
+tail -f ~/.rustchain/miner.log
 ```
 </details>
 
@@ -614,13 +616,23 @@ curl -fsS https://rustchain.org/epoch
 <details>
 <summary><b>Common installation issues</b></summary>
 
-- **Rust toolchain not found**: Install via curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-- **Build fails on Windows**: Use WSL2 or MSYS2 with proper C toolchain
-- **Permission denied on miner binary**: Run chmod +x ./clawrtc-miner
+- **Python not found**: The miner needs Python 3. On vintage platforms (PowerPC Tiger/Leopard), see [Hardware Requirements](docs/HARDWARE_REQUIREMENTS.md) for the legacy miner path.
+- **Service did not start after install**: Check `systemctl --user status rustchain-miner` (Linux) or `~/.rustchain/miner.log` (macOS).
+- **Building the node from source**: Rust and dev tooling are only needed for node development, not for mining. See the [Build Guide](docs/BUILD.md).
 
 For more details, see the [Beginner Quickstart](docs/QUICKSTART.md).
 </details>
 
 For deeper debugging, see the [CLI Wallet Walkthrough](docs/CLI.md) and [Local Devnet Guide](docs/DEVNET.md).
+
 ---
-*Documentation improved for readability.*
+
+<div align="center">
+
+**[Elyan Labs](https://elyanlabs.ai)** · Built with $0 VC and a room full of pawn shop hardware
+
+*"Mais, it still works, so why you gonna throw it away?"*
+
+[Boudreaux Principles](https://rustchain.org/principles.html) · [Green Tracker](https://rustchain.org/preserved.html) · [Bounties](https://github.com/Scottcjn/rustchain-bounties/issues)
+
+</div>

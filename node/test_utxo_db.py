@@ -1115,6 +1115,54 @@ class TestUtxoDB(unittest.TestCase):
         self.assertEqual([tx['tx_id'] for tx in candidates], ['spend_oracle' * 5])
         self.assertTrue(self.db.mempool_check_double_spend(alice_box['box_id']))
 
+    def test_mempool_block_candidates_skip_same_input_conflicts(self):
+        """Candidate selection must be defensive against stale input claims.
+
+        Normal mempool_add() rejects two live transactions that spend the same
+        box. However, stale/corrupt rows can exist after a crash, failed
+        migration, manual repair, or earlier cleanup bug. Block-template
+        selection is the final safety boundary and must never return two
+        candidates that cannot both apply sequentially.
+        """
+        self._apply_coinbase('alice', 100 * UNIT, block_height=1)
+        box = self.db.get_unspent_for_address('alice')[0]
+        now = int(time.time())
+        high = {
+            'tx_id': 'same_input_high',
+            'inputs': [{'box_id': box['box_id']}],
+            'outputs': [{'address': 'bob', 'value_nrtc': 100 * UNIT - 5000}],
+            'fee_nrtc': 5000,
+        }
+        low = {
+            'tx_id': 'same_input_low',
+            'inputs': [{'box_id': box['box_id']}],
+            'outputs': [{'address': 'carol', 'value_nrtc': 100 * UNIT - 1000}],
+            'fee_nrtc': 1000,
+        }
+
+        conn = self.db._conn()
+        try:
+            # Simulate an inconsistent mempool snapshot with two tx payloads
+            # for one spend input. Only one input-claim row can exist because
+            # utxo_mempool_inputs.box_id is the primary key.
+            for tx in (high, low):
+                conn.execute(
+                    """INSERT INTO utxo_mempool
+                       (tx_id, tx_data_json, fee_nrtc, submitted_at, expires_at)
+                       VALUES (?,?,?,?,?)""",
+                    (tx['tx_id'], json.dumps(tx), tx['fee_nrtc'], now, now + 3600),
+                )
+            conn.execute(
+                "INSERT INTO utxo_mempool_inputs (box_id, tx_id) VALUES (?,?)",
+                (box['box_id'], high['tx_id']),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        candidates = self.db.mempool_get_block_candidates(max_count=10)
+        self.assertEqual([tx['tx_id'] for tx in candidates], ['same_input_high'])
+
     def test_mempool_nonexistent_input_rejected(self):
         tx = {
             'tx_id': 'cccc' * 16,
@@ -1868,6 +1916,58 @@ class TestUtxoDB(unittest.TestCase):
                     self.assertEqual(db.mempool_get_block_candidates(), [])
                     self.assertFalse(
                         db.mempool_check_double_spend(box['box_id']))
+    def test_mempool_persists_only_normalized_transaction_intent(self):
+        """Caller-controlled extras and proofs must not be stored in mempool."""
+        self._apply_coinbase('alice', 100 * UNIT)
+        box = self.db.get_unspent_for_address('alice')[0]
+
+        ok = self.db.mempool_add({
+            'tx_id': 'normalized-intent',
+            'tx_type': 'transfer',
+            'inputs': [{
+                'box_id': box['box_id'],
+                'spending_proof': 'S' * 100_000,
+                'attacker_note': 'do not persist me',
+            }],
+            'outputs': [{
+                'address': 'bob',
+                'value_nrtc': 90 * UNIT,
+                'ignored_output_field': 'do not persist me',
+            }],
+            'fee_nrtc': 10 * UNIT,
+            'timestamp': 12345,
+            '_allow_minting': True,
+            'garbage': 'X' * 20_000,
+            'nested_spam': {'payload': ['x'] * 1000},
+        })
+
+        self.assertTrue(ok)
+
+        conn = self.db._conn()
+        try:
+            row = conn.execute(
+                "SELECT tx_data_json FROM utxo_mempool WHERE tx_id = ?",
+                ('normalized-intent',),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        stored = json.loads(row['tx_data_json'])
+        self.assertEqual(set(stored), {
+            'tx_id', 'tx_type', 'inputs', 'outputs', 'fee_nrtc',
+            'timestamp',
+        })
+        self.assertEqual(stored['inputs'], [{'box_id': box['box_id']}])
+        self.assertEqual(stored['outputs'], [{
+            'address': 'bob',
+            'value_nrtc': 90 * UNIT,
+            'tokens_json': '[]',
+            'registers_json': '{}',
+        }])
+        self.assertNotIn('_allow_minting', stored)
+        self.assertNotIn('garbage', stored)
+        self.assertNotIn('spending_proof', json.dumps(stored))
+        self.assertLess(len(row['tx_data_json']), 1000)
 
     def test_apply_transaction_rejects_oversized_output_text(self):
         """Direct block application must reject oversized persisted fields."""

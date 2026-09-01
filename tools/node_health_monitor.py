@@ -30,6 +30,14 @@ DIM    = "\033[2m"
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
 SLOW_THRESHOLD_MS = 1000   # response times above this are "yellow"
+
+# The node exposes /health and /epoch. It has never exposed /status, which is
+# what this monitor asked for, so every probe of a real node returned 404 and
+# was filed as "slow" with no epoch: the monitor had never once read state from
+# node 1 or node 2. Combined with a dead node reporting online, the result was
+# exactly inverted. /epoch is tried first because it carries both the epoch and
+# the enrolled miner count; /status is kept for any deployment that has it.
+STATUS_ENDPOINTS = ("/epoch", "/status", "/health")
 REQUEST_TIMEOUT   = 5      # seconds per HTTP request
 
 # ── Known attestation nodes ───────────────────────────────────────────────────
@@ -86,8 +94,9 @@ class NodeHealthMonitor:
         """
         start = time.monotonic()
         try:
+            path = getattr(self, "_status_path", None) or STATUS_ENDPOINTS[0]
             req = urllib.request.Request(
-                f"{url}/status",
+                f"{url}{path}",
                 headers={"Accept": "application/json", "User-Agent": "RustChain-HealthMonitor/1.0"},
             )
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
@@ -96,18 +105,58 @@ class NodeHealthMonitor:
                 try:
                     data = json.loads(raw)
                 except json.JSONDecodeError:
-                    data = {}
+                    data = None
                 if not isinstance(data, dict):
-                    data = {}
+                    data = None
+
+                # A 200 is not evidence of a node.
+                #
+                # RustChain node 4 stopped being a node and the host was reused
+                # for a single-page app. An SPA answers 200 on EVERY unknown
+                # path, so /status returned 200 with HTML, json.loads failed,
+                # the body was quietly replaced with {}, and the node was
+                # reported "online" indefinitely because status was decided
+                # purely on response time. The loss went unnoticed for months.
+                #
+                # A node is online only if it answered with JSON that actually
+                # carries node state. Anything else is impersonating one.
+                if data is None:
+                    return NodeStatus(
+                        url=url,
+                        status="offline",
+                        response_time_ms=round(elapsed_ms, 1),
+                        epoch=None,
+                        miners=None,
+                        error=(f"/status returned {len(raw)} bytes of non-JSON "
+                               f"(is this still a node?): {raw[:60]!r}"),
+                    )
 
                 epoch  = data.get("epoch") or data.get("current_epoch")
-                miners = data.get("miners") or data.get("active_miners") or data.get("miner_count")
+                miners = (data.get("miners") or data.get("active_miners")
+                          or data.get("miner_count") or data.get("enrolled_miners"))
 
-                # Coerce to int if present
-                if epoch is not None:
-                    epoch = int(epoch)
-                if miners is not None:
-                    miners = int(miners)
+                # Coerce to int if present, tolerating a malformed value rather
+                # than raising inside the probe.
+                try:
+                    epoch = int(epoch) if epoch is not None else None
+                except (TypeError, ValueError):
+                    epoch = None
+                try:
+                    miners = int(miners) if miners is not None else None
+                except (TypeError, ValueError):
+                    miners = None
+
+                # JSON with no epoch is not node state either — it is some
+                # other service that happens to speak JSON on this address.
+                if epoch is None:
+                    return NodeStatus(
+                        url=url,
+                        status="offline",
+                        response_time_ms=round(elapsed_ms, 1),
+                        epoch=None,
+                        miners=miners,
+                        error="/status carried no epoch (not a RustChain node?)",
+                    )
 
                 status = "slow" if elapsed_ms > SLOW_THRESHOLD_MS else "online"
                 return NodeStatus(
@@ -121,6 +170,21 @@ class NodeHealthMonitor:
 
         except urllib.error.HTTPError as exc:
             elapsed_ms = (time.monotonic() - start) * 1000
+            # A 404 means this deployment does not expose the path we asked
+            # for, not that the node is unwell. Try the next known endpoint
+            # before concluding anything: asking /status of a node that only
+            # serves /epoch is how every real node came back "slow" forever.
+            if exc.code == 404:
+                tried = getattr(self, "_status_path", None) or STATUS_ENDPOINTS[0]
+                remaining = [p for p in STATUS_ENDPOINTS if p != tried]
+                for nxt in remaining:
+                    self._status_path = nxt
+                    try:
+                        result = self.check_node(url)
+                    finally:
+                        self._status_path = None
+                    if result.status != "offline" or "404" not in (result.error or ""):
+                        return result
             # Node replied but with an error code — treat as degraded
             return NodeStatus(
                 url=url,
@@ -158,7 +222,14 @@ class NodeHealthMonitor:
 
         online = [s for s in statuses if s.status != "offline"]
         nodes_online = len(online)
-        total_miners = sum(s.miners or 0 for s in online)
+        # The attestation nodes are replicas of one shared ledger, so each online
+        # node reports the SAME network-wide miner count (the sibling tools
+        # ledger_verify / node_sync_validator flag any divergence as a mismatch).
+        # Summing per-node counts would multiply the true figure by the number of
+        # online nodes, so take the agreed value (max is robust to a node that is
+        # mid-sync and momentarily reporting fewer miners).
+        miner_counts = [s.miners for s in online if s.miners is not None]
+        total_miners = max(miner_counts) if miner_counts else 0
 
         epochs = {s.epoch for s in online if s.epoch is not None}
         consensus_ok = len(epochs) <= 1  # 0 or 1 distinct epoch → consensus holds

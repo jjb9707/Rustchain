@@ -41,6 +41,7 @@ _BOXES_MAX_LIMIT = 500
 # Cursor values are bound to SQLite's signed 64-bit integer range; values past it
 # would raise OverflowError at parameter binding (a 500) instead of a clean 400.
 _INT64_MAX = (1 << 63) - 1
+_NONCE_MAX_DIGITS = len(str(_INT64_MAX))
 
 
 def _parse_rtc_amount(raw) -> Decimal:
@@ -94,6 +95,16 @@ def _decimal_to_nrtc(amount: Decimal, field_name: str) -> int:
 def _nrtc_to_rtc_float(amount_nrtc: int) -> float:
     """Convert exact nanoRTC integer amounts to JSON-compatible RTC floats."""
     return float(Decimal(amount_nrtc) / Decimal(UNIT))
+
+
+def _safe_json_loads(raw, default_val):
+    """Safely deserialize JSON string, falling back to default on None or corrupt values."""
+    if raw is None or not isinstance(raw, (str, bytes, bytearray)):
+        return default_val
+    try:
+        return json.loads(raw)
+    except Exception:
+        return default_val
 
 
 def _public_mempool_transaction(tx: dict) -> dict:
@@ -185,6 +196,46 @@ _current_slot_fn = None    # current_slot() -> int
 _dual_write: bool = False
 
 
+def _selected_account_mirror_boxes(conn: sqlite3.Connection, selected: list) -> list:
+    """Which of the selected boxes are account-mirror provenance (bounty #2819).
+
+    Uses the ``account_mirror_boxes`` discriminator the node maintains, not a
+    ``registers_json`` marker match: a marker is lost on change boxes from
+    partial spends, and "any box the sender owns" would wrongly block
+    independently-earned UTXOs. Absent table (pure-UTXO DB) means no mirrors.
+    """
+    if not selected:
+        return []
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='account_mirror_boxes'"
+    ).fetchone():
+        return []
+    box_ids = [u['box_id'] for u in selected]
+    placeholders = ','.join('?' * len(box_ids))
+    rows = conn.execute(
+        f"SELECT box_id FROM account_mirror_boxes WHERE box_id IN ({placeholders})",
+        box_ids,
+    ).fetchall()  # fetchall-ok: bounded-by-schema
+    return [r[0] for r in rows]
+
+
+def _spendable_utxo_candidates(conn: sqlite3.Connection, candidates: list) -> tuple:
+    """Remove account-mirror boxes from UTXO selection while dual-write is off."""
+    mirrored = set(_selected_account_mirror_boxes(conn, candidates))
+    if not mirrored:
+        return candidates, []
+    return [box for box in candidates if box.get('box_id') not in mirrored], sorted(mirrored)
+
+
+def _account_mirror_blocked_response(box_ids: list):
+    return jsonify({
+        'error': 'Box mirrors an account balance; move it via the account '
+                 'transfer path while dual-write is off',
+        'code': 'ACCOUNT_MIRROR_BOX_NOT_SPENDABLE',
+        'box_ids': box_ids,
+    }), 409
+
+
 def _ensure_transfer_nonce_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -233,12 +284,16 @@ def _parse_transfer_nonce(nonce_raw):
         nonce_text = nonce_raw.strip()
         if not nonce_text.isdigit():
             raise ValueError('nonce must be an integer greater than or equal to 0')
+        if len(nonce_text) > _NONCE_MAX_DIGITS:
+            raise ValueError('nonce exceeds signed 64-bit integer range')
         nonce_int = int(nonce_text)
     else:
         raise ValueError('nonce must be an integer greater than or equal to 0')
 
     if nonce_int < 0:
         raise ValueError('nonce must be an integer greater than or equal to 0')
+    if nonce_int > _INT64_MAX:
+        raise ValueError('nonce exceeds signed 64-bit integer range')
 
     return str(nonce_int), nonce_int
 
@@ -364,7 +419,7 @@ def utxo_boxes(address):
                 'creation_height': b['creation_height'],
                 'transaction_id': b['transaction_id'],
                 'output_index': b['output_index'],
-                'registers': json.loads(b.get('registers_json', '{}')),
+                'registers': _safe_json_loads(b.get('registers_json'), {}),
             }
             for b in boxes
         ],
@@ -388,8 +443,8 @@ def utxo_box(box_id):
         'spent': box['spent_at'] is not None,
         'spent_at': box['spent_at'],
         'spent_by_tx': box['spent_by_tx'],
-        'registers': json.loads(box.get('registers_json', '{}')),
-        'tokens': json.loads(box.get('tokens_json', '[]')),
+        'registers': _safe_json_loads(box.get('registers_json'), {}),
+        'tokens': _safe_json_loads(box.get('tokens_json'), []),
     })
 
 
@@ -659,11 +714,30 @@ def utxo_transfer():
     # 28999999.999... → 28999999 lost-rtc bug).
     target_nrtc = amount_nrtc + fee_nrtc
 
-    # Select UTXOs
-    utxos = _utxo_db.get_unspent_for_address(from_address)
+    # Select UTXOs.
+    # Bounded fetch: coin_select() only ever reads the cheapest or the dearest
+    # slice of a wallet, so loading every unspent box let a third party inflate
+    # the cost of this call by sending dust to the sender's address.
+    utxos = _utxo_db.get_coin_select_candidates(from_address)
+    all_candidate_total_nrtc = sum(u['value_nrtc'] for u in utxos)
+    # SECURITY(danaher-j / #2819 residual): exclude account-mirror boxes from
+    # UTXO coin selection in BOTH dual-write states. Under UTXO_DUAL_WRITE=1 the
+    # /utxo/transfer path mints receiver+change outputs with NO
+    # account_mirror_boxes provenance; a later rollback to dual_write=0 then
+    # leaves that migrated value spendable through BOTH the UTXO and account
+    # models (double spend). Migrated funds must always move via the account
+    # path, so the mirror-box exclusion cannot be gated on dual-write.
+    mirror_candidate_ids = []
+    conn = sqlite3.connect(_db_path)
+    try:
+        utxos, mirror_candidate_ids = _spendable_utxo_candidates(conn, utxos)
+    finally:
+        conn.close()
     selected, change_nrtc = coin_select(utxos, target_nrtc)
 
     if not selected:
+        if mirror_candidate_ids and all_candidate_total_nrtc >= target_nrtc:
+            return _account_mirror_blocked_response(mirror_candidate_ids)
         utxo_balance = _utxo_db.get_balance(from_address)
         return jsonify({
             'error': 'Insufficient UTXO balance',
@@ -730,10 +804,70 @@ def utxo_transfer():
                 'latest_nonce': int(previous_nonce),
             }), 400
 
+        # Account-mirrored boxes ARE the sender's account balance (bounty #2819).
+        # The account->UTXO direction is reconciled by the node's
+        # _settle_account_transfer_in_utxo, which runs independent of dual-write
+        # precisely because "a migrated box must be reconciled whenever it exists".
+        # This is the same crossing in reverse. Spending a mirror box through the
+        # UTXO path mints change with no mirror provenance; under dual_write=1 the
+        # shadow debit hides it until a rollback to dual_write=0 makes the same
+        # value spendable via BOTH models (danaher-j double spend). Fail closed in
+        # EVERY dual-write state -- migrated funds move via the account path.
+        # In-transaction recheck (preserved): candidates were pre-filtered above,
+        # but re-verify under BEGIN IMMEDIATE to close the TOCTOU window against a
+        # concurrent migration that marks a selected box as a mirror after
+        # selection.
+        mirrored = _selected_account_mirror_boxes(conn, selected)
+        if mirrored:
+            conn.rollback()
+            return _account_mirror_blocked_response(mirrored)
+
         ok = _utxo_db.apply_transaction(tx, block_height, conn=conn)
         if not ok:
             conn.rollback()
             return jsonify({'error': 'UTXO transaction failed (race condition or validation)'}), 500
+
+        if _dual_write:
+            amount_i64 = amount_i64_for_dual_write
+            fee_i64 = effective_fee_i64_for_dual_write
+            debit_i64 = amount_i64 + fee_i64
+
+            # Keep the UTXO state transition and shadow account write atomic.
+            # If the shadow model cannot mirror the spend, roll back the UTXO
+            # application too; otherwise /utxo/integrity reports success-path
+            # divergence while the endpoint still returns ok=True.
+            shadow_row = conn.execute(
+                "SELECT amount_i64 FROM balances WHERE miner_id = ?",
+                (from_address,),
+            ).fetchone()
+            shadow_balance = shadow_row[0] if shadow_row else 0
+            if shadow_balance < debit_i64:
+                conn.rollback()
+                return jsonify({
+                    'error': 'Insufficient dual-write shadow balance',
+                    'code': 'DUAL_WRITE_SHADOW_BALANCE',
+                    'shadow_balance_i64': shadow_balance,
+                    'required_i64': debit_i64,
+                }), 409
+
+            conn.execute("INSERT OR IGNORE INTO balances (miner_id, amount_i64) VALUES (?, 0)",
+                         (to_address,))
+            conn.execute("UPDATE balances SET amount_i64 = amount_i64 - ? WHERE miner_id = ?",
+                         (debit_i64, from_address))
+            conn.execute("UPDATE balances SET amount_i64 = amount_i64 + ? WHERE miner_id = ?",
+                         (amount_i64, to_address))
+            now = int(time.time())
+            slot = _current_slot_fn()
+            conn.execute(
+                "INSERT INTO ledger (ts, epoch, miner_id, delta_i64, reason) VALUES (?,?,?,?,?)",
+                (now, slot, from_address, -debit_i64,
+                 f"utxo_transfer_out:{to_address[:20]}:fee={fee_i64}:{memo[:30]}")
+            )
+            conn.execute(
+                "INSERT INTO ledger (ts, epoch, miner_id, delta_i64, reason) VALUES (?,?,?,?,?)",
+                (now, slot, to_address, amount_i64,
+                 f"utxo_transfer_in:{from_address[:20]}:{memo[:30]}")
+            )
 
         conn.commit()
     except Exception:
@@ -744,55 +878,6 @@ def utxo_transfer():
         raise
     finally:
         conn.close()
-
-    # --- dual-write to account model ----------------------------------------
-
-    if _dual_write:
-        try:
-            conn = sqlite3.connect(_db_path)
-            c = conn.cursor()
-            amount_i64 = amount_i64_for_dual_write
-            fee_i64 = effective_fee_i64_for_dual_write
-            debit_i64 = amount_i64 + fee_i64
-
-            # Re-check sender shadow-balance before debit (security: prevent
-            # negative-balance minting when account-model diverges from UTXO
-            # due to non-UTXO writes, prior dual-write failures, or races).
-            c.execute("SELECT amount_i64 FROM balances WHERE miner_id = ?",
-                      (from_address,))
-            shadow_row = c.fetchone()
-            shadow_balance = shadow_row[0] if shadow_row else 0
-            if shadow_balance < debit_i64:
-                conn.close()
-                print(
-                    f"[UTXO] WARNING: dual-write skipped — insufficient "
-                    f"shadow balance for {from_address[:20]}... "
-                    f"(have {shadow_balance}, need {debit_i64})"
-                )
-            else:
-                c.execute("INSERT OR IGNORE INTO balances (miner_id, amount_i64) VALUES (?, 0)",
-                          (to_address,))
-                c.execute("UPDATE balances SET amount_i64 = amount_i64 - ? WHERE miner_id = ?",
-                          (debit_i64, from_address))
-                c.execute("UPDATE balances SET amount_i64 = amount_i64 + ? WHERE miner_id = ?",
-                          (amount_i64, to_address))
-                now = int(time.time())
-                slot = _current_slot_fn()
-                c.execute(
-                    "INSERT INTO ledger (ts, epoch, miner_id, delta_i64, reason) VALUES (?,?,?,?,?)",
-                    (now, slot, from_address, -debit_i64,
-                     f"utxo_transfer_out:{to_address[:20]}:fee={fee_i64}:{memo[:30]}")
-                )
-                c.execute(
-                    "INSERT INTO ledger (ts, epoch, miner_id, delta_i64, reason) VALUES (?,?,?,?,?)",
-                    (now, slot, to_address, amount_i64,
-                     f"utxo_transfer_in:{from_address[:20]}:{memo[:30]}")
-                )
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            # Log but don't fail — UTXO is primary, account is shadow
-            print(f"[UTXO] WARNING: dual-write to account model failed: {e}")
 
     # --- response -----------------------------------------------------------
 

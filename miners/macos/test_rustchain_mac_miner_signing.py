@@ -2,6 +2,7 @@ import base64
 import importlib.util
 import json
 import pathlib
+import subprocess
 import unittest
 from tempfile import TemporaryDirectory
 
@@ -137,16 +138,32 @@ class MacMinerSigningTests(unittest.TestCase):
 
 @unittest.skipIf(SigningKey is None, "PyNaCl unavailable")
 class AttestationSignMessageTests(unittest.TestCase):
-    def test_sign_message_matches_node_pipe_format(self):
+    def test_canonical_attestation_bytes_are_deterministic(self):
         module = load_miner_module()
-        msg = module._attestation_sign_message("miner-1", "RTCabc", "nonce-xyz", "commit-hash")
-        self.assertEqual(msg, "miner-1|RTCabc|nonce-xyz|commit-hash")
+        attestation = {
+            "miner": "RTCabc",
+            "miner_id": "miner-1",
+            "report": {"nonce": "nonce-xyz", "commitment": "commit-hash"},
+            "device": {"arch": "pentium_iii"},
+        }
+        self.assertEqual(
+            module._canonical_attestation_bytes(attestation),
+            json.dumps(
+                attestation, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8"),
+        )
 
-    def test_signature_over_sign_message_verifies(self):
+    def test_signature_over_canonical_attestation_verifies(self):
         module = load_miner_module()
         sk = SigningKey.generate()
-        msg = module._attestation_sign_message("RTCwallet", "RTCwallet", "n1", "c1")
-        sk.verify_key.verify(msg.encode(), sk.sign(msg.encode()).signature)
+        msg = module._canonical_attestation_bytes(
+            {
+                "miner": "RTCwallet",
+                "miner_id": "RTCwallet",
+                "report": {"nonce": "n1", "commitment": "c1"},
+            }
+        )
+        sk.verify_key.verify(msg, sk.sign(msg).signature)
 
 
 class ExtractPkcs8Tests(unittest.TestCase):
@@ -161,6 +178,86 @@ class ExtractPkcs8Tests(unittest.TestCase):
         seed = b"\x22" * 32
         der = bytes.fromhex("302e020100300506032b657004220420") + seed
         self.assertEqual(module._extract_pkcs8_ed25519_seed(der), seed)
+
+
+class MacIdentityTests(unittest.TestCase):
+    def test_import_does_not_exit_without_requests(self):
+        module = load_miner_module()
+        self.assertTrue(hasattr(module, "_extract_pkcs8_ed25519_seed"))
+
+    def test_hardware_uuid_is_not_reported_as_serial(self):
+        module = load_miner_module()
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            if args[:2] == ["system_profiler", "SPHardwareDataType"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout="\nHardware:\n    Hardware UUID: 12345678-ABCD-EF00-1111-222222222222\n",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        original_run = module.subprocess.run
+        module.subprocess.run = fake_run
+        try:
+            identity = module.get_mac_identity()
+        finally:
+            module.subprocess.run = original_run
+
+        self.assertIsNone(identity["serial"])
+        self.assertEqual(identity["hardware_uuid"], "12345678-ABCD-EF00-1111-222222222222")
+        self.assertFalse(identity["serial_present"])
+        self.assertEqual(identity["serial_source"], "hardware_uuid_fallback")
+
+    def test_ioreg_serial_is_accepted_when_system_profiler_serial_missing(self):
+        module = load_miner_module()
+
+        def fake_run(args, **kwargs):
+            if args[:2] == ["system_profiler", "SPHardwareDataType"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout="\nHardware:\n    Hardware UUID: 12345678-ABCD-EF00-1111-222222222222\n",
+                    stderr="",
+                )
+            if args and args[0] == "ioreg":
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout='    | |   "IOPlatformSerialNumber" = "C02TEST12345"\n',
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        original_run = module.subprocess.run
+        module.subprocess.run = fake_run
+        try:
+            identity = module.get_mac_identity()
+        finally:
+            module.subprocess.run = original_run
+
+        self.assertEqual(identity["serial"], "C02TEST12345")
+        self.assertTrue(identity["serial_present"])
+        self.assertEqual(identity["serial_source"], "serial_number")
+
+    def test_serial_binding_status_fails_without_real_serial(self):
+        module = load_miner_module()
+        fp = {"checks": {"clock_drift": {"passed": True}}, "all_passed": True}
+        hw = {
+            "serial": None,
+            "hardware_uuid": "12345678-ABCD-EF00-1111-222222222222",
+            "serial_source": "hardware_uuid_fallback",
+        }
+
+        out = module.attach_serial_binding_status(fp, hw)
+
+        self.assertFalse(out["all_passed"])
+        self.assertFalse(out["serial_binding_passed"])
+        self.assertFalse(out["checks"]["serial_binding"]["passed"])
+        self.assertTrue(out["checks"]["serial_binding"]["data"]["hardware_uuid_fallback_present"])
 
 
 if __name__ == "__main__":

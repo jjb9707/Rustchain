@@ -30,6 +30,7 @@ from claims_eligibility import (
     check_epoch_participation,
     get_wallet_address,
     check_pending_claim,
+    check_already_claimed,
     is_epoch_settled,
     calculate_epoch_reward,
     check_claim_eligibility,
@@ -499,6 +500,35 @@ class TestCheckClaimEligibility(unittest.TestCase):
             self.assertIn(result["reason"],
                           ["epoch_not_settled", "no_epoch_participation"])
 
+    def test_settled_claim_blocks_reclaim(self):
+        """A reward that was already claimed and settled must not be claimable
+        again — check_pending_claim only tracks in-flight statuses, so the
+        terminal 'settled' status needs its own guard."""
+        epoch = max(0, self.current_epoch - 1)
+
+        # Baseline: test-miner-g5 is fully eligible for this epoch.
+        before = check_claim_eligibility(
+            self.db_path, "test-miner-g5", epoch,
+            self.current_slot, self.now)
+        self.assertTrue(before["eligible"])
+
+        # Record a settled (paid-out) claim for that miner/epoch.
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO claims (claim_id, miner_id, epoch, status, submitted_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, ("claim-g5-settled", "test-miner-g5", epoch,
+                   "settled", self.now - 3600))
+            conn.commit()
+
+        # The already-settled epoch must now be rejected as claimable.
+        self.assertTrue(check_already_claimed(self.db_path, "test-miner-g5", epoch))
+        after = check_claim_eligibility(
+            self.db_path, "test-miner-g5", epoch,
+            self.current_slot, self.now)
+        self.assertFalse(after["eligible"])
+        self.assertEqual(after["reason"], "already_claimed")
+
 
 class TestGetEligibleEpochs(unittest.TestCase):
     """get_eligible_epochs"""
@@ -532,6 +562,31 @@ class TestGetEligibleEpochs(unittest.TestCase):
             0, 0, limit=5)
         self.assertEqual(result["epochs"], [])
         self.assertEqual(result["total_unclaimed_urtc"], 0)
+
+    def test_ineligible_epoch_without_claim_not_marked_claimed(self):
+        """An epoch a miner is ineligible for (but never claimed) must report
+        claimed=False. Regression: the flag used to be derived from the
+        eligibility verdict, so any not-eligible epoch was marked claimed even
+        with zero claim rows."""
+        for miner in ("test-miner-fail", "test-miner-nowallet"):
+            with self.subTest(miner=miner):
+                # Sanity: this miner has no claim rows in the fixture.
+                conn = sqlite3.connect(self.db_path)
+                n = conn.execute(
+                    "SELECT COUNT(*) FROM claims WHERE miner_id = ?",
+                    (miner,)).fetchone()[0]
+                conn.close()
+                self.assertEqual(n, 0)
+
+                result = get_eligible_epochs(
+                    self.db_path, miner,
+                    self.current_slot, self.now, limit=6)
+                self.assertTrue(result["epochs"])
+                for e in result["epochs"]:
+                    # No claim exists, so nothing can be "claimed".
+                    self.assertFalse(
+                        e["claimed"],
+                        f"epoch {e['epoch']} marked claimed with no claim row")
 
 
 class TestEdgeCases(unittest.TestCase):

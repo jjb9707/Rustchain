@@ -66,6 +66,11 @@ MIN_ETH_BALANCE_WEI = int(0.01 * 1e18)  # 0.01 ETH
 MIN_WALLET_AGE_DAYS = 7
 MIN_GITHUB_AGE_DAYS = 30
 GITHUB_USERNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$")
+# EVM addresses are case-insensitive: mixed case is only an EIP-55 display
+# checksum over the same 20 bytes. Solana addresses are base58 and ARE
+# case-sensitive, so they must never be folded.
+EVM_ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
+EVM_CHAINS = frozenset({"base"})
 MAX_BRIDGE_ADDRESS_LENGTH = 128
 MAX_BRIDGE_TX_LENGTH = 256
 
@@ -322,6 +327,22 @@ class AirdropV2:
     def _is_valid_github_username(github_username: str) -> bool:
         return bool(GITHUB_USERNAME_RE.fullmatch(github_username))
 
+    @staticmethod
+    def _normalize_wallet_address(wallet_address: str, chain: str) -> str:
+        """Canonicalize a wallet address for uniqueness comparison.
+
+        EVM (Base) addresses are case-insensitive — the mixed-case form is
+        only an EIP-55 checksum over the same 20 bytes — so they are folded
+        to lowercase. Without this, the same Base wallet can claim the
+        airdrop once per casing variant, defeating the "one claim per
+        GitHub/wallet" anti-Sybil rule. Solana addresses are base58 and are
+        case-sensitive, so they are left byte-exact.
+        """
+        address = (wallet_address or "").strip()
+        if chain in EVM_CHAINS and EVM_ADDRESS_RE.fullmatch(address):
+            return address.lower()
+        return address
+
     def check_eligibility(
         self,
         github_username: str,
@@ -355,6 +376,7 @@ class AirdropV2:
                 eligible=False,
                 reason=f"Unsupported chain: {chain}. Must be 'solana' or 'base'",
             )
+        wallet_address = self._normalize_wallet_address(wallet_address, chain_lower)
 
         checks = {}
 
@@ -695,6 +717,7 @@ class AirdropV2:
     ) -> bool:
         """Check if a GitHub account or wallet already claimed an airdrop."""
         github_username = self._normalize_github_username(github_username)
+        wallet_address = self._normalize_wallet_address(wallet_address, chain)
         conn = self._get_conn()
         cursor = conn.cursor()
         cursor.execute(
@@ -767,6 +790,44 @@ class AirdropV2:
     # Claim Processing
     # ========================================================================
 
+    def _verify_github_ownership(
+        self, github_username: str, token: str
+    ) -> Tuple[bool, str]:
+        """Verify the caller controls `github_username` via a GitHub token.
+
+        Closes #8175 (cross-user airdrop claim theft): the claim endpoint
+        previously accepted any `github_username` and only checked that the
+        account EXISTS (via the GitHub API), never that the caller controls it.
+        An attacker could claim on behalf of any qualifying GitHub user and
+        redirect the airdrop to their own wallet.
+
+        We require a GitHub token whose authenticated `login` matches the
+        claimed username. Returns (True, "") on success, else (False, reason).
+        """
+        try:
+            import requests
+
+            resp = requests.get(
+                "https://api.github.com/user",
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github.v3+json",
+                },
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return False, f"GitHub token invalid (status {resp.status_code})"
+            login = (resp.json().get("login") or "").lower()
+            if login != github_username.lower():
+                return (
+                    False,
+                    f"GitHub token owner '{login}' does not match claimed "
+                    f"username '{github_username}'",
+                )
+            return True, ""
+        except requests.RequestException as e:
+            return False, f"GitHub ownership check failed: {e}"
+
     def claim_airdrop(
         self,
         github_username: str,
@@ -794,6 +855,22 @@ class AirdropV2:
         if not self._is_valid_github_username(github_username):
             return False, "Invalid GitHub username", None
         chain_lower = chain.lower()
+        wallet_address = self._normalize_wallet_address(wallet_address, chain_lower)
+
+        # GitHub account ownership verification (closes #8175: cross-user
+        # airdrop claim theft). Without this, anyone could claim on behalf of
+        # any qualifying GitHub username and redirect tokens to their wallet.
+        # Testing mode (skip_antisybil) bypasses this, as do the unit tests.
+        if not skip_antisybil:
+            if not github_token:
+                return (
+                    False,
+                    "GitHub ownership verification required: provide a GitHub token",
+                    None,
+                )
+            owned, owner_msg = self._verify_github_ownership(github_username, github_token)
+            if not owned:
+                return False, owner_msg, None
 
         if self._has_claimed(github_username, wallet_address, chain_lower):
             return False, "Claim already exists for this GitHub account or wallet", None

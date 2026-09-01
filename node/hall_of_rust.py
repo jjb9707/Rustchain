@@ -131,13 +131,20 @@ def calculate_rust_score(machine, current_year=None):
         score += RUST_WEIGHTS['first_attestation']
     
     # Architecture bonuses
+    # NOTE: keys must be lower-case — `arch` below is lower-cased before the
+    # substring match, so upper-case keys (e.g. 'G4') could never match and the
+    # PowerPC bonus was silently dropped.
     arch_bonus = {
-        'G3': 80, 'G4': 70, 'G5': 60,
+        'g3': 80, 'g4': 70, 'g5': 60,
         '486': 150, 'pentium': 100, 'pentium4': 50,
         'retro': 40, 'apple_silicon': 5, 'modern': 0
     }
     arch = machine.get('device_arch', 'modern').lower()
-    for key, bonus in arch_bonus.items():
+    # Match the most specific key first: 'pentium' is a substring of 'pentium4',
+    # so iterating in dict order would match 'pentium' (100) for a Pentium 4 and
+    # never reach 'pentium4' (50), leaving that entry unreachable and inflating
+    # the leaderboard score. Longest key first makes the specific match win.
+    for key, bonus in sorted(arch_bonus.items(), key=lambda kv: -len(kv[0])):
         if key in arch:
             score += bonus
             break
@@ -190,8 +197,11 @@ def induct_machine():
         c = conn.cursor()
         
         # Check if already inducted
-        c.execute("SELECT id, total_attestations FROM hall_of_rust WHERE fingerprint_hash = ?", 
-                  (fingerprint_hash,))
+        c.execute("""
+            SELECT id, total_attestations, manufacture_year, device_arch, device_model,
+                   thermal_events
+            FROM hall_of_rust WHERE fingerprint_hash = ?
+        """, (fingerprint_hash,))
         existing = c.fetchone()
         
         now = int(time.time())
@@ -206,19 +216,33 @@ def induct_machine():
         device_family = device_family or 'Unknown'
         
         if existing:
-            # Update attestation count
+            # Update attestation count. Attestation loyalty feeds calculate_rust_score,
+            # so the score has to be recomputed here too — otherwise it stays frozen at
+            # whatever it was on induction day and the leaderboard never reflects the
+            # attestations this machine has kept filing.
+            new_attestations = existing[1] + 1
+            rust_score = calculate_rust_score({
+                'manufacture_year': existing[2],
+                'device_arch': existing[3] or 'modern',
+                'device_model': existing[4] or '',
+                'total_attestations': new_attestations,
+                'thermal_events': existing[5] or 0,
+                'id': existing[0]
+            })
             c.execute("""
-                UPDATE hall_of_rust 
-                SET total_attestations = total_attestations + 1,
-                    last_attestation = ?
+                UPDATE hall_of_rust
+                SET total_attestations = ?,
+                    last_attestation = ?,
+                    rust_score = ?
                 WHERE fingerprint_hash = ?
-            """, (now, fingerprint_hash))
+            """, (new_attestations, now, rust_score, fingerprint_hash))
             conn.commit()
             conn.close()
             return jsonify({
-                'inducted': False, 
+                'inducted': False,
                 'message': 'Already in Hall of Rust',
-                'attestation_count': existing[1] + 1
+                'attestation_count': new_attestations,
+                'rust_score': rust_score
             })
         
         # New induction!

@@ -155,7 +155,25 @@ class TestValidatorAgent:
         assert stats["total_validated"] == 5
         assert stats["total_rejected"] == 0
         assert stats["average_score"] > 0
-    
+
+    def test_average_score_excludes_rejected_from_denominator(self, validator_agent, sample_poa_submission):
+        """average_score is the mean over VALIDATED scores only; rejected proofs
+        (which contribute no score) must not dilute the denominator."""
+        # One rejected proof (missing every required field -> score 0, not summed).
+        rejected = validator_agent.validate_poa_proof({})
+        assert not rejected.valid
+
+        # One valid proof.
+        valid = validator_agent.validate_poa_proof(sample_poa_submission)
+        assert valid.valid
+
+        stats = validator_agent.get_stats()
+        assert stats["total_validated"] == 1
+        assert stats["total_rejected"] == 1
+        # Exactly one validated score was recorded, so the mean equals that score.
+        # On the buggy path the divisor was validated+rejected (2), halving it.
+        assert stats["average_score"] == pytest.approx(valid.score)
+
     def test_strict_validation_level(self, sample_poa_submission):
         """Test strict validation level applies harsher scoring"""
         strict_validator = ValidatorAgent(
@@ -403,14 +421,15 @@ class TestRTCTransactionFlow:
 
         assert result["success"] is True
         receipt_data = result["receipt"]
-        # Receipt verification checks signature matches the data
-        # In mock mode, signature is generated from the same data so it should match
+        # The receipt is signed over its own canonical fields, so an untampered
+        # receipt must verify successfully.
         is_valid = verify_receipt(receipt_data)
-        
-        # The receipt is valid if the signature matches the data
-        # Note: Our verify function checks if signature == hash of receipt data
-        # Since we sign the transaction data and store in receipt, this should work
-        assert isinstance(is_valid, bool)
+        assert is_valid is True
+
+        # Tampering with any signed field must invalidate the receipt.
+        tampered = dict(receipt_data)
+        tampered["amount"] = receipt_data["amount"] + 1
+        assert verify_receipt(tampered) is False
     
     def test_mode_switching(self):
         """Test switching between mock and real modes"""

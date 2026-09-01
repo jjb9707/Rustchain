@@ -7,6 +7,7 @@ Run: python3 -m pytest test_utxo_endpoints.py -v
 
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -289,6 +290,52 @@ class TestUtxoEndpoints(unittest.TestCase):
         sender_bal = self.utxo_db.get_balance('RTC_test_aabbccdd')
         self.assertEqual(sender_bal, 40 * UNIT)
 
+    def test_transfer_skips_mempool_claimed_inputs_when_clean_box_can_fund(self):
+        """A pending mempool spend must not poison /utxo/transfer coin selection."""
+        sender = 'RTC_test_aabbccdd'
+        self._seed_coinbase(sender, 1 * UNIT, height=1)
+        self._seed_coinbase(sender, 50 * UNIT, height=2)
+        boxes = sorted(
+            self.utxo_db.get_unspent_for_address(sender),
+            key=lambda box: box['value_nrtc'],
+        )
+        claimed_box = boxes[0]
+
+        self.assertTrue(self.utxo_db.mempool_add({
+            'tx_id': 'pending-small-input',
+            'tx_type': 'transfer',
+            'inputs': [{'box_id': claimed_box['box_id'], 'spending_proof': 'sig'}],
+            'outputs': [{'address': 'carol', 'value_nrtc': 1 * UNIT}],
+            'fee_nrtc': 0,
+            'timestamp': int(time.time()),
+        }))
+        self.assertTrue(self.utxo_db.mempool_check_double_spend(claimed_box['box_id']))
+
+        r = self.client.post('/utxo/transfer', json={
+            'from_address': sender,
+            'to_address': 'bob',
+            'amount_rtc': 10.0,
+            'public_key': 'aabbccdd' * 8,
+            'signature': 'sig' * 22,
+            'nonce': int(time.time() * 1000),
+        })
+
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(r.get_json()['inputs_consumed'], 1)
+        self.assertEqual(self.utxo_db.get_balance('bob'), 10 * UNIT)
+        self.assertEqual(self.utxo_db.get_balance(sender), 41 * UNIT)
+        self.assertTrue(self.utxo_db.mempool_check_double_spend(claimed_box['box_id']))
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            spent = conn.execute(
+                'SELECT spent_at FROM utxo_boxes WHERE box_id = ?',
+                (claimed_box['box_id'],),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertIsNone(spent)
+
     def test_transfer_insufficient(self):
         self._seed_coinbase('RTC_test_aabbccdd', 50 * UNIT)
 
@@ -345,7 +392,7 @@ class TestUtxoEndpoints(unittest.TestCase):
         sender = 'RTC_test_aabbccdd'
         self._seed_coinbase(sender, 100 * UNIT)
 
-        for bad_nonce in (-1, 'abc', '12.5'):
+        for bad_nonce in (-1, 'abc', '12.5', 1 << 80, '9' * 1000):
             with self.subTest(nonce=bad_nonce):
                 r = self.client.post('/utxo/transfer', json={
                     'from_address': sender,
@@ -358,7 +405,10 @@ class TestUtxoEndpoints(unittest.TestCase):
                 self.assertEqual(r.status_code, 400)
                 data = r.get_json()
                 self.assertEqual(data['code'], 'INVALID_NONCE')
-                self.assertIn('greater than or equal to 0', data['error'])
+                self.assertTrue(
+                    'greater than or equal to 0' in data['error']
+                    or 'signed 64-bit integer range' in data['error']
+                )
 
     def test_transfer_rejects_stale_nonce_after_newer_nonce(self):
         sender = 'RTC_test_aabbccdd'
@@ -924,6 +974,58 @@ class TestUtxoDualWrite(unittest.TestCase):
             self._account_balance(sender),
             100 * utxo_endpoints.ACCOUNT_UNIT,
         )
+
+    def test_dual_write_shadow_insufficient_rolls_back_utxo_state(self):
+        """A shadow-balance failure must not leave a committed UTXO transfer.
+
+        Before the fix, the endpoint committed the UTXO spend, then skipped the
+        account shadow write when balances.amount_i64 was too low, returning
+        ok=True with /utxo/integrity permanently diverged.
+        """
+        sender = 'RTC_test_aabbccdd'
+        recipient = 'bob'
+        self.utxo_db.apply_transaction({
+            'tx_type': 'mining_reward',
+            'inputs': [],
+            'outputs': [{'address': sender, 'value_nrtc': 100 * UNIT}],
+            'timestamp': int(time.time()),
+            '_allow_minting': True,
+        }, block_height=1)
+
+        import sqlite3
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "INSERT INTO balances (miner_id, amount_i64) VALUES (?, ?)",
+                (sender, 50 * utxo_endpoints.ACCOUNT_UNIT),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        r = self.client.post('/utxo/transfer', json={
+            'from_address': sender,
+            'to_address': recipient,
+            'amount_rtc': 90.0,
+            'fee_rtc': 1.0,
+            'public_key': 'aabbccdd' * 8,
+            'signature': 'sig' * 22,
+            'nonce': int(time.time() * 1000),
+        })
+        data = r.get_json()
+
+        self.assertEqual(r.status_code, 409, data)
+        self.assertEqual(data['code'], 'DUAL_WRITE_SHADOW_BALANCE')
+        self.assertEqual(self.utxo_db.get_balance(sender), 100 * UNIT)
+        self.assertEqual(self.utxo_db.get_balance(recipient), 0)
+        self.assertEqual(
+            self._account_balance(sender),
+            50 * utxo_endpoints.ACCOUNT_UNIT,
+        )
+        integrity = self.client.get('/utxo/integrity').get_json()
+        self.assertFalse(integrity['models_agree'])
+        self.assertEqual(integrity['total_unspent_nrtc'], 100 * UNIT)
+        self.assertEqual(integrity['account_total_nrtc'], 50 * UNIT)
 
 
 if __name__ == '__main__':

@@ -36,6 +36,8 @@ from typing import Any, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 UNIT = 100_000_000          # 1 RTC = 100,000,000 nanoRTC (8 decimals)
+ACCOUNT_UNIT = 1_000_000    # account model: 1 RTC = 1,000,000 uRTC (6 decimals)
+NRTC_PER_ACCOUNT_UNIT = UNIT // ACCOUNT_UNIT  # 100: uRTC (i64) -> nRTC scale
 DUST_THRESHOLD = 1_000      # nanoRTC below which change is absorbed into fee
 MAX_COINBASE_OUTPUT_NRTC = 150 * UNIT  # Max minting output per block (150 RTC)
 MAX_POOL_SIZE = 10_000
@@ -44,6 +46,11 @@ MAX_POOL_SIZE = 10_000
 # Without this, a single tx creates unlimited outputs, bloating the UTXO set.
 MAX_INPUTS = 100
 MAX_OUTPUTS = 100
+
+# coin_select() never returns more than this many inputs: smallest-first is
+# abandoned above it, and largest-first is hard-capped at it. Coin selection
+# therefore only ever needs a bounded slice of a wallet, never all of it.
+COIN_SELECT_MAX_INPUTS = 20
 MAX_DATA_INPUTS = 100
 MAX_UTXO_ADDRESS_BYTES = 256
 MAX_UTXO_METADATA_BYTES = 8_192
@@ -448,6 +455,70 @@ class UtxoDB:
         finally:
             conn.close()
 
+    def get_coin_select_candidates(
+        self, address: str, max_inputs: int = COIN_SELECT_MAX_INPUTS
+    ) -> List[dict]:
+        """Bounded candidate set for coin selection over *address*.
+
+        `coin_select()` reads a wallet in only two orders: smallest-first, which
+        it abandons once the selection exceeds COIN_SELECT_MAX_INPUTS, and
+        largest-first, which it caps at that same bound. So it can never look
+        past the cheapest `max_inputs + 1` boxes or the dearest `max_inputs`,
+        and loading the rest is wasted work.
+
+        That waste is attacker-controlled: anyone may send minimum-value boxes
+        to any address, so an unbounded fetch lets a third party fragment a
+        wallet and make each of the owner's later transfers materialize the
+        whole thing. Fetching a bounded slice keeps the cost of a transfer
+        independent of how fragmented the wallet is.
+
+        Returns the union of both immediately-spendable slices, deduplicated by
+        box_id. Feeding this to coin_select() yields the same selection as
+        feeding it every unspent, unclaimed box, because both of its passes see
+        an identical prefix.
+
+        Pending mempool spend-claims are intentionally excluded. /utxo/transfer
+        creates an immediate settlement transaction, not a block-candidate
+        confirmation of the stored mempool tx_id, so selecting a claimed box
+        only makes apply_transaction() fail after coin selection even when an
+        unclaimed box can fund the payment.
+        """
+        if not isinstance(max_inputs, int) or isinstance(max_inputs, bool) or max_inputs < 1:
+            raise ValueError("max_inputs must be a positive integer")
+
+        base = """SELECT * FROM utxo_boxes
+                  WHERE owner_address = ? AND spent_at IS NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM utxo_mempool_inputs mi
+                        WHERE mi.box_id = utxo_boxes.box_id
+                    )"""
+        self.mempool_clear_expired()
+        conn = self._conn()
+        try:
+            # Smallest-first needs one extra row: it is the row that proves the
+            # selection would have exceeded the cap, sending coin_select() down
+            # its largest-first path.
+            cheapest = conn.execute(
+                base + " ORDER BY value_nrtc ASC, box_id ASC LIMIT ?",
+                (address, max_inputs + 1),
+            ).fetchall()  # fetchall-ok: already-paginated (LIMIT max_inputs + 1)
+            dearest = conn.execute(
+                base + " ORDER BY value_nrtc DESC, box_id DESC LIMIT ?",
+                (address, max_inputs),
+            ).fetchall()  # fetchall-ok: already-paginated (LIMIT max_inputs)
+        finally:
+            conn.close()
+
+        merged: List[dict] = []
+        seen = set()
+        for row in list(cheapest) + list(dearest):
+            box = dict(row)
+            if box["box_id"] in seen:
+                continue
+            seen.add(box["box_id"])
+            merged.append(box)
+        return merged
+
     def count_unspent_for_address(self, address: str) -> int:
         """Count unspent boxes for an address without materializing them."""
         conn = self._conn()
@@ -587,10 +658,12 @@ class UtxoDB:
             if not isinstance(registers, dict):
                 return None
 
-            record = dict(out)
-            record['tokens_json'] = tokens_json
-            record['registers_json'] = registers_json
-            normalized.append(record)
+            normalized.append({
+                'address': address,
+                'value_nrtc': val,
+                'tokens_json': tokens_json,
+                'registers_json': registers_json,
+            })
 
         return normalized
 
@@ -880,6 +953,19 @@ class UtxoDB:
                 'timestamp': ts,
                 'block_height': block_height,
             }
+            # Mints must not inherit the settling node's wall clock.
+            # `timestamp` defaults to time.time() above, and the production
+            # mint path (epoch reward settlement) passes no timestamp, so
+            # leaving it in the identity makes tx_id -> box_id -> the Merkle
+            # leaf node-local: two honest nodes settling the same epoch
+            # seconds apart derive different roots from identical state, and
+            # a resync cannot rebuild the UTXO set it replays.  Dropping it
+            # cannot collide: at most one mint may exist per block_height
+            # (enforced above), so block_height + outputs is already a unique
+            # mint identity.  Spend paths keep binding their explicit
+            # timestamp, which distinguishes otherwise-identical transfers.
+            if tx_type in MINTING_TX_TYPES:
+                del tx_identity['timestamp']
             tx_seed = json.dumps(
                 tx_identity, sort_keys=True, separators=(',', ':')
             ).encode()
@@ -1101,9 +1187,76 @@ class UtxoDB:
                     result['ok'] = False
                     result['diff_nrtc'] = total - expected_total
 
+            # SECURITY(danaher-j / #2819 residual): a total-only comparison stays
+            # models_agree=True even when a specific wallet holds more unspent
+            # account-mirror UTXO value than its account balance -- the exact
+            # signature of the dual-write double spend (migrated value spendable
+            # via BOTH models nets to zero across all wallets). Assert the
+            # per-wallet invariant that summed unspent mirror-box value never
+            # exceeds that wallet's account balance, and fail with a DISTINCT key
+            # so the divergence cannot hide behind matching totals.
+            self._check_mirror_provenance(conn, result)
+
             return result
         finally:
             conn.close()
+
+    @staticmethod
+    def _check_mirror_provenance(conn: sqlite3.Connection, result: dict) -> None:
+        """Per-wallet assertion: unspent account-mirror value <= account balance.
+
+        Guards the danaher-j dual-write double spend, where migrated value became
+        spendable through both the UTXO and account models. A total-only
+        integrity comparison misses it because the surplus in one wallet nets
+        against a deficit elsewhere; this checks each wallet independently.
+
+        Skips silently (records ``mirror_provenance_checked=False``) on a
+        pure-UTXO database that lacks the ``account_mirror_boxes`` or ``balances``
+        table. On violation sets ``ok=False`` and populates the DISTINCT key
+        ``mirror_exceeds_account`` so the failure is not confused with a
+        total-sum mismatch.
+        """
+        have = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('account_mirror_boxes','balances')"
+            )
+        }
+        if {'account_mirror_boxes', 'balances'} - have:
+            result['mirror_provenance_checked'] = False
+            return
+
+        result['mirror_provenance_checked'] = True
+        violations = []
+        # Stream the cursor row-by-row (no full materialization); one row per
+        # wallet that owns at least one unspent mirror box.
+        rows = conn.execute(
+            """
+            SELECT m.account_wallet AS wallet,
+                   COALESCE(SUM(b.value_nrtc), 0) AS mirror_nrtc,
+                   COALESCE((SELECT amount_i64 FROM balances
+                             WHERE miner_id = m.account_wallet), 0) AS acct_i64
+            FROM account_mirror_boxes m
+            JOIN utxo_boxes b
+              ON b.box_id = m.box_id AND b.spent_at IS NULL
+            GROUP BY m.account_wallet
+            """
+        )
+        for row in rows:
+            mirror_nrtc = row['mirror_nrtc']
+            account_nrtc = row['acct_i64'] * NRTC_PER_ACCOUNT_UNIT
+            if mirror_nrtc > account_nrtc:
+                violations.append({
+                    'wallet': row['wallet'],
+                    'mirror_unspent_nrtc': mirror_nrtc,
+                    'account_balance_nrtc': account_nrtc,
+                    'excess_nrtc': mirror_nrtc - account_nrtc,
+                })
+
+        if violations:
+            result['ok'] = False
+            result['mirror_exceeds_account'] = violations
 
     # -- mempool -------------------------------------------------------------
 
@@ -1269,7 +1422,25 @@ class UtxoDB:
             # With IGNORE, a duplicate tx_id silently skips the insert but
             # execution continues to claim inputs — creating orphan entries
             # that lock UTXOs with no corresponding mempool transaction.
-            tx_data_json = json.dumps(tx)
+            # Store only the normalized transaction intent.  Persisting the
+            # caller's raw dict lets arbitrary fields, internal flags, and
+            # giant spending proofs bloat tx_data_json and confuse block
+            # candidate consumers; apply_transaction only needs box IDs.
+            tx_for_mempool = {
+                'tx_id': tx_id,
+                'tx_type': tx_type,
+                'inputs': [{'box_id': inp['box_id']} for inp in inputs],
+                'outputs': outputs,
+                'fee_nrtc': fee,
+                'timestamp': timestamp,
+            }
+            if data_inputs:
+                tx_for_mempool['data_inputs'] = data_inputs
+            tx_data_json = json.dumps(
+                tx_for_mempool,
+                sort_keys=True,
+                separators=(',', ':'),
+            )
             if len(tx_data_json) > MAX_TX_DATA_JSON_BYTES:
                 if manage_tx:
                     conn.execute("ROLLBACK")
@@ -1468,8 +1639,14 @@ class UtxoDB:
                 else:
                     input_set = set(input_ids)
                     data_input_set = set(data_inputs)
+                    # Data inputs are read-only witnesses: they may be reused
+                    # by multiple block-template candidates.  Only reject
+                    # candidates where a box is both spent and witnessed across
+                    # the selected set, or where two candidates spend the same
+                    # box.
                     if (
-                        input_set & selected_data_inputs
+                        input_set & selected_spend_inputs
+                        or input_set & selected_data_inputs
                         or data_input_set & selected_spend_inputs
                     ):
                         continue
@@ -1496,9 +1673,16 @@ class UtxoDB:
             conn.close()
 
     def mempool_clear_expired(self) -> int:
-        """Remove expired transactions from mempool. Returns count removed."""
+        """Remove expired transactions from mempool. Returns count removed.
+
+        Uses BEGIN IMMEDIATE to ensure the SELECT-then-DELETE sequence is
+        atomic. Without it, a concurrent mempool_add() or apply_transaction()
+        can interleave between the SELECT and the DELETEs, causing mempool
+        state corruption / double-spend (B2, issue #8176).
+        """
         conn = self._conn()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             now = int(time.time())
             try:
                 expired = conn.execute(
@@ -1507,22 +1691,29 @@ class UtxoDB:
                 ).fetchall()
             except sqlite3.OperationalError as exc:
                 if "no such table" in str(exc).lower():
+                    conn.execute("ROLLBACK")
                     return 0
+                conn.execute("ROLLBACK")
                 raise
-            else:
-                count = 0
-                for row in expired:
-                    conn.execute(
-                        "DELETE FROM utxo_mempool_inputs WHERE tx_id = ?",
-                        (row['tx_id'],),
-                    )
-                    conn.execute(
-                        "DELETE FROM utxo_mempool WHERE tx_id = ?",
-                        (row['tx_id'],),
-                    )
-                    count += 1
-                conn.commit()
-                return count
+            count = 0
+            for row in expired:
+                conn.execute(
+                    "DELETE FROM utxo_mempool_inputs WHERE tx_id = ?",
+                    (row['tx_id'],),
+                )
+                conn.execute(
+                    "DELETE FROM utxo_mempool WHERE tx_id = ?",
+                    (row['tx_id'],),
+                )
+                count += 1
+            conn.commit()
+            return count
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
         finally:
             conn.close()
 
